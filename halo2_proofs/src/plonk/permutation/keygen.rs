@@ -161,17 +161,22 @@ impl Assembly {
         mul_acc(&mut omega_powers);
 
         // Compute [omega_powers * \delta^0, omega_powers * \delta^1, ..., omega_powers * \delta^m]
-        let mut deltaomega = Vec::with_capacity(p.columns.len());
-        {
-            let mut cur = C::Scalar::one();
-            for _ in 0..p.columns.len() {
-                let mut omega_powers = omega_powers.clone();
-                omega_powers.par_iter_mut().for_each(|o| *o *= &cur);
-                deltaomega.push(omega_powers);
+        let deltaomega = {
+            let mut deltaomega = vec![C::Scalar::DELTA; p.columns.len()];
+            deltaomega[0] = C::Scalar::one();
 
-                cur *= &C::Scalar::DELTA;
-            }
-        }
+            mul_acc(&mut deltaomega);
+
+            deltaomega
+                .par_iter_mut()
+                .map(|delta| {
+                    let mut omega_powers = omega_powers.clone();
+                    omega_powers.par_iter_mut().for_each(|o| *o *= *delta);
+                    omega_powers
+                })
+                .collect::<Vec<Vec<_>>>()
+        };
+        drop(omega_powers);
 
         // Compute permutation polynomials, convert to coset form.
         let mut permutations = vec![];

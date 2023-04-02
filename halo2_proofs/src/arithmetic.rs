@@ -681,7 +681,7 @@ pub fn mul_acc<F: FieldExt>(f: &mut [F]) {
         }
     } else {
         let chunk_size = len / 4;
-        let chunk_acc = f
+        let mut chunk_acc = f
             .par_chunks_mut(chunk_size)
             .map(|chunk| {
                 chunk[0] = chunk[0];
@@ -692,14 +692,18 @@ pub fn mul_acc<F: FieldExt>(f: &mut [F]) {
             })
             .collect::<Vec<_>>();
 
-        let mut acc = chunk_acc[0];
-        for (chunk, curr_acc) in f.chunks_mut(chunk_size).zip(chunk_acc.into_iter()).skip(1) {
-            chunk.par_iter_mut().for_each(|p| {
-                *p = *p * acc;
-            });
-
-            acc *= curr_acc;
+        for i in 1..chunk_acc.len() {
+            chunk_acc[i] = chunk_acc[i - 1] * chunk_acc[i];
         }
+
+        f.par_chunks_mut(chunk_size)
+            .skip(1)
+            .enumerate()
+            .for_each(|(index, chunk)| {
+                chunk.par_iter_mut().for_each(|p| {
+                    *p = *p * chunk_acc[index];
+                })
+            });
     }
 }
 
