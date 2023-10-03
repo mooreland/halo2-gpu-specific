@@ -1459,7 +1459,7 @@ impl<F: FieldExt> ProveExpression<F> {
         disjoint
     }
 
-    pub(crate) fn mk_group(tree: &[(Vec<ProveExpressionUnit>, BTreeMap<u32, F>)]) -> Vec<Vec<(Vec<ProveExpressionUnit>, BTreeMap<u32, F>)>> {
+    pub(crate) fn mk_group(tree: &Vec<(Vec<ProveExpressionUnit>, BTreeMap<u32, F>)>) -> Vec<Vec<(Vec<ProveExpressionUnit>, BTreeMap<u32, F>)>> {
         let mut vs: Vec<Vec<(Vec<ProveExpressionUnit>, BTreeMap<u32, F>)>> = vec![];
         for (es, m) in tree {
             let mut ns = vec![];
