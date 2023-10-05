@@ -149,11 +149,13 @@ impl<F: FieldExt> LookupProveExpression<F> {
                     .run()?;
 
                 if Rc::strong_count(&l.0) == 1 {
-                    allocator.push_back(Rc::try_unwrap(l.0).unwrap())
+                    allocator.push_back(Rc::try_unwrap(l.0).unwrap());
+                    println!("allocator size after push {}", allocator.len());
                 }
 
                 if Rc::strong_count(&r.0) == 1 {
-                    allocator.push_back(Rc::try_unwrap(r.0).unwrap())
+                    allocator.push_back(Rc::try_unwrap(r.0).unwrap());
+                    println!("allocator size after push {}", allocator.len());
                 }
 
                 //end_timer!(timer);
@@ -196,11 +198,13 @@ impl<F: FieldExt> LookupProveExpression<F> {
                     .run()?;
 
                 if Rc::strong_count(&l.0) == 1 {
-                    allocator.push_back(Rc::try_unwrap(l.0).unwrap())
+                    allocator.push_back(Rc::try_unwrap(l.0).unwrap());
+                    println!("allocator size after push {}", allocator.len());
                 }
 
                 if Rc::strong_count(&r.0) == 1 {
-                    allocator.push_back(Rc::try_unwrap(r.0).unwrap())
+                    allocator.push_back(Rc::try_unwrap(r.0).unwrap());
+                    println!("allocator size after push {}", allocator.len());
                 }
                 //end_timer!(timer);
                 Ok((res, 0))
@@ -234,7 +238,8 @@ impl<F: FieldExt> LookupProveExpression<F> {
                     .run()?;
 
                 if Rc::strong_count(&l.0) == 1 {
-                    allocator.push_back(Rc::try_unwrap(l.0).unwrap())
+                    allocator.push_back(Rc::try_unwrap(l.0).unwrap());
+                    println!("allocator size after push {}", allocator.len());
                 }
 
                 //end_timer!(timer);
@@ -578,11 +583,13 @@ impl<F: FieldExt> ProveExpression<F> {
                             .run()?;
 
                         if Rc::strong_count(&l.0) == 1 {
-                            allocator.push_back(Rc::try_unwrap(l.0).unwrap())
+                            allocator.push_back(Rc::try_unwrap(l.0).unwrap());
+                            println!("allocator size after push {}", allocator.len());
                         }
 
                         if Rc::strong_count(&r.0) == 1 {
-                            allocator.push_back(Rc::try_unwrap(r.0).unwrap())
+                            allocator.push_back(Rc::try_unwrap(r.0).unwrap());
+                            println!("allocator size after push {}", allocator.len());
                         }
 
                         Ok((Some((res, 0)), None))
@@ -621,7 +628,8 @@ impl<F: FieldExt> ProveExpression<F> {
                             .run()?;
 
                         if Rc::strong_count(&b.0) == 1 {
-                            allocator.push_back(Rc::try_unwrap(b.0).unwrap())
+                            allocator.push_back(Rc::try_unwrap(b.0).unwrap());
+                            println!("allocator size after push {}", allocator.len());
                         }
 
                         Ok((Some((res, 0)), None))
@@ -674,7 +682,10 @@ impl<F: FieldExt> ProveExpression<F> {
                     let buffer = do_extended_fft(pk, program, origin_values, allocator, helper)?;
 
                     let value = if cache_action == CacheAction::Cache {
-                        unit_cache.update(group, buffer, |buffer| allocator.push_back(buffer))
+                        unit_cache.update(group, buffer, |buffer| {
+                            allocator.push_back(buffer);
+                            println!("allocator size after push {}", allocator.len());
+                        })
                     } else {
                         Rc::new(buffer)
                     };
@@ -724,7 +735,8 @@ impl<F: FieldExt> ProveExpression<F> {
                     .run()?;
 
                 if Rc::strong_count(&l.0) == 1 {
-                    allocator.push_back(Rc::try_unwrap(l.0).unwrap())
+                    allocator.push_back(Rc::try_unwrap(l.0).unwrap());
+                    println!("allocator size after push {}", allocator.len());
                 }
 
                 Ok((Some((res, 0)), None))
@@ -977,6 +989,7 @@ pub(crate) fn do_fft_core<F: FieldExt>(
     }
 
     allocator.push_back(dst_buffer);
+                    println!("allocator size after push {}", allocator.len());
 
     Ok(src_buffer)
 }
