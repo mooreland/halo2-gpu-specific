@@ -191,6 +191,66 @@ impl<F:FieldExt> ProveExpression<F> {
         }
     }
 
+    pub fn flat_unit_scale(&self, n: usize) -> Option<(Vec<ProveExpressionUnit>, Vec<Self>)> {
+        match &self {
+            ProveExpression::Op(a, b, Bop::Sum) => {
+                if let Some ((mut ua, mut va)) = a.flat_unit_scale(n) {
+                    if let Some ((mut ub, mut vb)) = b.flat_unit_scale(n) {
+                        ua.append(&mut ub);
+                        va.append(&mut vb);
+                        let mut s = HashSet::new();
+                        for x in &ua {
+                            s.insert(x.get_group());
+                        }
+                        if s.len() <= n {
+                            Some ((ua, va))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            },
+            ProveExpression::Scale(a, _) => match a.as_ref().clone() {
+                ProveExpression::Unit(x) => Some ((vec![x.clone()], vec![self.clone()])),
+                _ => None
+            },
+            _ => None
+        }
+
+    }
+
+    pub fn flat_unique_rotation_scale(&self) -> Option<(i32, Vec<Self>)> {
+        match &self {
+            ProveExpression::Op(a, b, Bop::Sum) => {
+                if let Some ((ra, mut va)) = a.flat_unique_rotation_scale() {
+                    if let Some ((rb, mut vb)) = b.flat_unique_rotation_scale() {
+                        va.append(&mut vb);
+                        if ra == rb {
+                            Some ((ra, va))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            },
+            ProveExpression::Scale(a, _) => match a.as_ref().clone() {
+                ProveExpression::Unit(x) => Some ((x.get_rotation(), vec![self.clone()])),
+                _ => None
+            },
+            _ => None
+        }
+
+    }
+
+
     pub fn flat_unique_unit_scale(&self) -> Option<(Self, Vec<Self>)> {
         match &self {
             ProveExpression::Op(a, b, Bop::Sum) => {
@@ -236,7 +296,7 @@ impl<F:FieldExt> ProveExpression<F> {
         }
     }
 
-    /// return
+    // return the coeff of Scale
     fn get_scale_coeff(&self, y: &mut Vec<F>) -> Option<F> {
         match &self {
             ProveExpression::Scale(a, ys) => {
@@ -254,10 +314,19 @@ impl<F:FieldExt> ProveExpression<F> {
         }
     }
 
+    // return the coeff of Scale
+    fn get_scale_unit(&self) -> Option<ProveExpressionUnit> {
+        match &self {
+            ProveExpression::Scale(a, ys) => a.get_unit(),
+            _ => None,
+        }
+    }
+
+
 
     pub fn depth(&self) -> usize {
         match &self {
-            ProveExpression::Unit(a) => {
+            ProveExpression::Unit(_) => {
                 1
             },
             ProveExpression::Op(a, b, _) => {
@@ -647,6 +716,11 @@ impl<T: std::fmt::Debug> Cache<T> {
 #[cfg(feature = "cuda")]
 impl<F: FieldExt> ProveExpression<F> {
     pub(crate) fn gen_cache_policy(&self, unit_cache: &mut Cache<Buffer<F>>) {
+        if let Some((_, exprs)) = self.flat_unique_rotation_scale() {
+            if exprs.len() > 1 {
+                return ()
+            }
+        }
         let handle_flat = if let Some ((uid, exprs)) = self.flat_unique_unit_scale() {
             if exprs.len() > 1 {
                 uid.gen_cache_policy(unit_cache);
@@ -794,7 +868,109 @@ impl<F: FieldExt> ProveExpression<F> {
         }
     }
 
-    fn eval_flat_scale<C: CurveAffine<ScalarExt = F>>(
+    fn eval_flat_scale_unique_rotation<C: CurveAffine<ScalarExt = F>>(
+        &self,
+        pk: &ProvingKey<C>,
+        program: &Program,
+        memory_cache: &BTreeMap<usize, usize>,
+        advice: &Vec<Polynomial<F, Coeff>>,
+        instance: &Vec<Polynomial<F, Coeff>>,
+        y: &mut Vec<F>,
+        unit_cache: &mut Cache<Buffer<F>>,
+        allocator: &mut LinkedList<Buffer<F>>,
+        helper: &mut ExtendedFFTHelper<F>,
+    ) -> EcResult<Option<(Rc<Buffer<F>>, i32)>> {
+        let size = 1u32 << pk.vk.domain.k();
+        let local_work_size = 128;
+        let global_work_size = size / local_work_size;
+
+        if let Some ((r, exprs)) = self.flat_unique_rotation_scale() {
+            if exprs.len() <= 1 {
+                Ok(None)
+            } else {
+                //println!("flat unique get {}", self.to_string());
+                let timer = start_timer!(|| "load values");
+                let cs = exprs.iter().map(|x| x.get_scale_coeff(y).unwrap()).collect::<Vec<F>>();
+                let mut acc_buffer = Rc::new(unsafe { program.create_buffer::<F>(size as usize)? });
+                let mut cache_tree = BTreeMap::<usize, Rc<Buffer<F>>>::new();
+                for a in &exprs {
+                    let unit = a.get_scale_unit().unwrap();
+                    if let None = cache_tree.get(&unit.get_group()) {
+                        let mut buffer = unsafe { program.create_buffer::<F>(size as usize)? };
+                        let (origin_values, _) = match unit {
+                            ProveExpressionUnit::Fixed {
+                                column_index,
+                                rotation,
+                            } => (&pk.fixed_polys[column_index], rotation),
+                            ProveExpressionUnit::Advice {
+                                column_index,
+                                rotation,
+                            } => (&advice[column_index], rotation),
+                            ProveExpressionUnit::Instance {
+                                column_index,
+                                rotation,
+                            } => (&instance[column_index], rotation),
+                        };
+
+                        program.write_from_buffer(&mut buffer, &origin_values.values)?;
+                        cache_tree.insert(unit.get_group(), Rc::new(buffer));
+                    }
+                }
+
+                end_timer!(timer);
+
+                let timer = start_timer!(|| "batch scale");
+
+                let kernel_name = format!("{}_eval_scale", "Bn256_Fr");
+                let kernel = program.create_kernel(
+                    &kernel_name,
+                    global_work_size as usize,
+                    local_work_size as usize,
+                )?;
+
+                let (fst, exprs) = exprs.split_at(1);
+                let c = program.create_buffer_from_slice(&vec![fst[0].get_scale_coeff(y).unwrap()])?;
+                let rot:i32 = 0;
+                kernel
+                    .arg(acc_buffer.as_ref())
+                    .arg(cache_tree.get(&fst[0].get_scale_unit().unwrap().get_group()).unwrap().as_ref())
+                    .arg(&rot)
+                    .arg(&size)
+                    .arg(&c)
+                    .run()?;
+
+                for exp in exprs {
+                    let kernel_name = format!("{}_eval_acc_scale", "Bn256_Fr");
+                    let kernel = program.create_kernel(
+                        &kernel_name,
+                        global_work_size as usize,
+                        local_work_size as usize,
+                    )?;
+
+                    let c = program.create_buffer_from_slice(&vec![exp.get_scale_coeff(y).unwrap()])?;
+
+                    //let timer = start_timer!(|| "batch eval scale");
+                    kernel
+                        .arg(acc_buffer.as_ref())
+                        .arg(cache_tree.get(&exp.get_scale_unit().unwrap().get_group()).unwrap().as_ref())
+                        .arg(&size)
+                        .arg(&c)
+                        .run()?;
+                }
+                let value_buffer = Rc::get_mut(&mut acc_buffer).unwrap();
+                let buffer = do_extended_fft_from_origin_values(pk, program, value_buffer, allocator, helper)?;
+                let res = (Rc::new(buffer), r);
+                end_timer!(timer);
+                Ok(Some(res))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+
+    /// sum_i S(a-i)
+    fn eval_flat_scale_unique_unit<C: CurveAffine<ScalarExt = F>>(
         &self,
         pk: &ProvingKey<C>,
         program: &Program,
@@ -876,7 +1052,7 @@ impl<F: FieldExt> ProveExpression<F> {
         let local_work_size = 128;
         let global_work_size = size / local_work_size;
         let rot_scale = 1 << (pk.vk.domain.extended_k() - pk.vk.domain.k());
-        if let Some(v) = self.eval_flat_scale (
+        if let Some(v) = self.eval_flat_scale_unique_unit (
                 pk,
                 program,
                 memory_cache,
@@ -887,205 +1063,217 @@ impl<F: FieldExt> ProveExpression<F> {
                 allocator,
                 helper
             )? {
-            Ok((Some((v, 0)), None))
-        } else {
-            match self {
-                ProveExpression::Op(l, r, op) => {
-                    let l = l._eval_gpu(
-                        pk, program, memory_cache,
-                        advice, instance, y, unit_cache, allocator, helper,
-                    )?;
-                    let r = r._eval_gpu(
-                        pk, program, memory_cache,
-                        advice, instance, y, unit_cache, allocator, helper,
-                    )?;
-                    //let timer = start_timer!(|| format!("gpu eval sum {} {:?} {:?}", size, l.0, r.0));
-                    let res = match (l.0, r.0) {
-                        (Some(l), Some(r)) => {
-                            let kernel_name = match op {
-                                Bop::Sum => format!("{}_eval_sum", "Bn256_Fr"),
-                                Bop::Product => format!("{}_eval_mul", "Bn256_Fr"),
-                            };
-                            let kernel = program.create_kernel(
-                                &kernel_name,
-                                global_work_size as usize,
-                                local_work_size as usize,
-                            )?;
-
-                            let res = if r.1 == 0 && Rc::strong_count(&r.0) == 1 {
-                                r.0.clone()
-                            } else if l.1 == 0 && Rc::strong_count(&l.0) == 1 {
-                                l.0.clone()
-                            } else {
-                                Rc::new(allocator.pop_front().unwrap_or_else(|| unsafe {
-                                    program.create_buffer::<F>(size as usize).unwrap()
-                                }))
-                            };
-
-                            kernel
-                                .arg(res.as_ref())
-                                .arg(l.0.as_ref())
-                                .arg(r.0.as_ref())
-                                .arg(&l.1)
-                                .arg(&r.1)
-                                .arg(&size)
-                                .run()?;
-
-                            if Rc::strong_count(&l.0) == 1 {
-                                allocator.push_back(Rc::try_unwrap(l.0).unwrap())
-                            }
-
-                            if Rc::strong_count(&r.0) == 1 {
-                                allocator.push_back(Rc::try_unwrap(r.0).unwrap())
-                            }
-
-                            Ok((Some((res, 0)), None))
-                        }
-                        (None, None) => match op {
-                            Bop::Sum => Ok((None, Some(l.1.unwrap() + r.1.unwrap()))),
-                            Bop::Product => Ok((None, Some(l.1.unwrap() * r.1.unwrap()))),
-                        },
-                        (None, Some(b)) | (Some(b), None) => {
-                            let c = l.1.or(r.1).unwrap();
-                            let c = program.create_buffer_from_slice(&vec![c])?;
-                            let kernel_name = match op {
-                                Bop::Sum => format!("{}_eval_sum_c", "Bn256_Fr"),
-                                Bop::Product => format!("{}_eval_mul_c", "Bn256_Fr"),
-                            };
-                            let kernel = program.create_kernel(
-                                &kernel_name,
-                                global_work_size as usize,
-                                local_work_size as usize,
-                            )?;
-
-                            let res = if b.1 == 0 && Rc::strong_count(&b.0) == 1 {
-                                b.0.clone()
-                            } else {
-                                Rc::new(allocator.pop_front().unwrap_or_else(|| unsafe {
-                                    program.create_buffer::<F>(size as usize).unwrap()
-                                }))
-                            };
-
-                            kernel
-                                .arg(res.as_ref())
-                                .arg(b.0.as_ref())
-                                .arg(&b.1)
-                                .arg(&c)
-                                .arg(&size)
-                                .run()?;
-
-                            if Rc::strong_count(&b.0) == 1 {
-                                allocator.push_back(Rc::try_unwrap(b.0).unwrap())
-                            }
-
-                            Ok((Some((res, 0)), None))
-                        }
-                    };
-                    //end_timer!(timer);
-
-                    res
-                }
-                ProveExpression::Y(ys) => {
-                    let max_y_order = ys.keys().max().unwrap();
-                    for _ in (y.len() as u32)..max_y_order + 1 {
-                        y.push(y[1] * y.last().unwrap());
-                    }
-
-                    //let timer = start_timer!(|| format!("gpu eval c {}", size));
-                    let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
-                        acc + y[*y_order as usize] * f
-                    });
-                    //end_timer!(timer);
-                    Ok((None, Some(c)))
-                }
-                ProveExpression::Unit(u) => {
-                    let group = u.get_group();
-                    let (cache, cache_action) = unit_cache.get(group);
-                    let (values, rotation) = if let Some(cached_values) = cache {
-                        //let timer = start_timer!(|| format!("processing unit {} hit", u.to_string()));
-                        let v = match u {
-                            ProveExpressionUnit::Fixed { rotation, .. }
-                            | ProveExpressionUnit::Advice { rotation, .. }
-                            | ProveExpressionUnit::Instance { rotation, .. } => {
-                                (cached_values, *rotation)
-                            }
+            return Ok((Some((v, 0)), None))
+        }
+        if let Some(v) = self.eval_flat_scale_unique_rotation(
+                pk,
+                program,
+                memory_cache,
+                advice,
+                instance,
+                y,
+                unit_cache,
+                allocator,
+                helper
+            )? {
+            return Ok((Some(v), None))
+        }
+        match self {
+            ProveExpression::Op(l, r, op) => {
+                let l = l._eval_gpu(
+                    pk, program, memory_cache,
+                    advice, instance, y, unit_cache, allocator, helper,
+                )?;
+                let r = r._eval_gpu(
+                    pk, program, memory_cache,
+                    advice, instance, y, unit_cache, allocator, helper,
+                )?;
+                //let timer = start_timer!(|| format!("gpu eval sum {} {:?} {:?}", size, l.0, r.0));
+                let res = match (l.0, r.0) {
+                    (Some(l), Some(r)) => {
+                        let kernel_name = match op {
+                            Bop::Sum => format!("{}_eval_sum", "Bn256_Fr"),
+                            Bop::Product => format!("{}_eval_mul", "Bn256_Fr"),
                         };
-                        //end_timer!(timer);
-                        v
-                    } else {
-                        //let timer = start_timer!(|| format!("processing unit {} miss", u.to_string()));
-                        let (origin_values, rotation) = match u {
-                            ProveExpressionUnit::Fixed {
-                                column_index,
-                                rotation,
-                            } => (&pk.fixed_polys[*column_index], rotation),
-                            ProveExpressionUnit::Advice {
-                                column_index,
-                                rotation,
-                            } => (&advice[*column_index], rotation),
-                            ProveExpressionUnit::Instance {
-                                column_index,
-                                rotation,
-                            } => (&instance[*column_index], rotation),
-                        };
+                        let kernel = program.create_kernel(
+                            &kernel_name,
+                            global_work_size as usize,
+                            local_work_size as usize,
+                        )?;
 
-                        let buffer =  do_extended_fft(pk, program, origin_values, allocator, helper)?;
-                        let value = if cache_action == CacheAction::Cache {
-                            unit_cache.update(group, buffer, |buffer| allocator.push_back(buffer))
+                        let res = if r.1 == 0 && Rc::strong_count(&r.0) == 1 {
+                            r.0.clone()
+                        } else if l.1 == 0 && Rc::strong_count(&l.0) == 1 {
+                            l.0.clone()
                         } else {
-                            Rc::new(buffer)
+                            Rc::new(allocator.pop_front().unwrap_or_else(|| unsafe {
+                                program.create_buffer::<F>(size as usize).unwrap()
+                            }))
                         };
-                        let res = (value, *rotation);
-                        //end_timer!(timer);
-                        res
-                    };
-                    Ok((Some((values, rotation.0 * rot_scale)), None))
-                }
-                ProveExpression::Scale(l, ys) => {
-                    let l = l._eval_gpu(
-                        pk, program, memory_cache,
-                        advice, instance, y, unit_cache, allocator, helper,
-                    )?;
-                    let l = l.0.unwrap();
-                    let max_y_order = ys.keys().max().unwrap();
-                    for _ in (y.len() as u32)..max_y_order + 1 {
-                        y.push(y[1] * y.last().unwrap());
+
+                        kernel
+                            .arg(res.as_ref())
+                            .arg(l.0.as_ref())
+                            .arg(r.0.as_ref())
+                            .arg(&l.1)
+                            .arg(&r.1)
+                            .arg(&size)
+                            .run()?;
+
+                        if Rc::strong_count(&l.0) == 1 {
+                            allocator.push_back(Rc::try_unwrap(l.0).unwrap())
+                        }
+
+                        if Rc::strong_count(&r.0) == 1 {
+                            allocator.push_back(Rc::try_unwrap(r.0).unwrap())
+                        }
+
+                        Ok((Some((res, 0)), None))
                     }
+                    (None, None) => match op {
+                        Bop::Sum => Ok((None, Some(l.1.unwrap() + r.1.unwrap()))),
+                        Bop::Product => Ok((None, Some(l.1.unwrap() * r.1.unwrap()))),
+                    },
+                    (None, Some(b)) | (Some(b), None) => {
+                        let c = l.1.or(r.1).unwrap();
+                        let c = program.create_buffer_from_slice(&vec![c])?;
+                        let kernel_name = match op {
+                            Bop::Sum => format!("{}_eval_sum_c", "Bn256_Fr"),
+                            Bop::Product => format!("{}_eval_mul_c", "Bn256_Fr"),
+                        };
+                        let kernel = program.create_kernel(
+                            &kernel_name,
+                            global_work_size as usize,
+                            local_work_size as usize,
+                        )?;
 
-                    //let timer = start_timer!(|| "gpu eval c");
-                    let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
-                        acc + y[*y_order as usize] * f
-                    });
-                    let c = program.create_buffer_from_slice(&vec![c])?;
+                        let res = if b.1 == 0 && Rc::strong_count(&b.0) == 1 {
+                            b.0.clone()
+                        } else {
+                            Rc::new(allocator.pop_front().unwrap_or_else(|| unsafe {
+                                program.create_buffer::<F>(size as usize).unwrap()
+                            }))
+                        };
 
-                    let kernel_name = format!("{}_eval_scale", "Bn256_Fr");
-                    let kernel = program.create_kernel(
-                        &kernel_name,
-                        global_work_size as usize,
-                        local_work_size as usize,
-                    )?;
+                        kernel
+                            .arg(res.as_ref())
+                            .arg(b.0.as_ref())
+                            .arg(&b.1)
+                            .arg(&c)
+                            .arg(&size)
+                            .run()?;
 
-                    let res = if l.1 == 0 && Rc::strong_count(&l.0) == 1 {
-                        l.0.clone()
+                        if Rc::strong_count(&b.0) == 1 {
+                            allocator.push_back(Rc::try_unwrap(b.0).unwrap())
+                        }
+
+                        Ok((Some((res, 0)), None))
+                    }
+                };
+                //end_timer!(timer);
+
+                res
+            }
+            ProveExpression::Y(ys) => {
+                let max_y_order = ys.keys().max().unwrap();
+                for _ in (y.len() as u32)..max_y_order + 1 {
+                    y.push(y[1] * y.last().unwrap());
+                }
+
+                //let timer = start_timer!(|| format!("gpu eval c {}", size));
+                let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
+                    acc + y[*y_order as usize] * f
+                });
+                //end_timer!(timer);
+                Ok((None, Some(c)))
+            }
+            ProveExpression::Unit(u) => {
+                let group = u.get_group();
+                let (cache, cache_action) = unit_cache.get(group);
+                let (values, rotation) = if let Some(cached_values) = cache {
+                    //let timer = start_timer!(|| format!("processing unit {} hit", u.to_string()));
+                    let v = match u {
+                        ProveExpressionUnit::Fixed { rotation, .. }
+                        | ProveExpressionUnit::Advice { rotation, .. }
+                        | ProveExpressionUnit::Instance { rotation, .. } => {
+                            (cached_values, *rotation)
+                        }
+                    };
+                    //end_timer!(timer);
+                    v
+                } else {
+                    //let timer = start_timer!(|| format!("processing unit {} miss", u.to_string()));
+                    let (origin_values, rotation) = match u {
+                        ProveExpressionUnit::Fixed {
+                            column_index,
+                            rotation,
+                        } => (&pk.fixed_polys[*column_index], rotation),
+                        ProveExpressionUnit::Advice {
+                            column_index,
+                            rotation,
+                        } => (&advice[*column_index], rotation),
+                        ProveExpressionUnit::Instance {
+                            column_index,
+                            rotation,
+                        } => (&instance[*column_index], rotation),
+                    };
+
+                    let buffer =  do_extended_fft(pk, program, origin_values, allocator, helper)?;
+                    let value = if cache_action == CacheAction::Cache {
+                        unit_cache.update(group, buffer, |buffer| allocator.push_back(buffer))
                     } else {
-                        Rc::new(allocator.pop_front().unwrap_or_else(|| unsafe {
-                            program.create_buffer::<F>(size as usize).unwrap()
-                        }))
+                        Rc::new(buffer)
                     };
-                    kernel
-                        .arg(res.as_ref())
-                        .arg(l.0.as_ref())
-                        .arg(&l.1)
-                        .arg(&size)
-                        .arg(&c)
-                        .run()?;
-
-                    if Rc::strong_count(&l.0) == 1 {
-                        allocator.push_back(Rc::try_unwrap(l.0).unwrap())
-                    }
-
-                    Ok((Some((res, 0)), None))
+                    let res = (value, *rotation);
+                    //end_timer!(timer);
+                    res
+                };
+                Ok((Some((values, rotation.0 * rot_scale)), None))
+            }
+            ProveExpression::Scale(l, ys) => {
+                let l = l._eval_gpu(
+                    pk, program, memory_cache,
+                    advice, instance, y, unit_cache, allocator, helper,
+                )?;
+                let l = l.0.unwrap();
+                let max_y_order = ys.keys().max().unwrap();
+                for _ in (y.len() as u32)..max_y_order + 1 {
+                    y.push(y[1] * y.last().unwrap());
                 }
+
+                //let timer = start_timer!(|| "gpu eval c");
+                let c = ys.iter().fold(F::zero(), |acc, (y_order, f)| {
+                    acc + y[*y_order as usize] * f
+                });
+                let c = program.create_buffer_from_slice(&vec![c])?;
+
+                let kernel_name = format!("{}_eval_scale", "Bn256_Fr");
+                let kernel = program.create_kernel(
+                    &kernel_name,
+                    global_work_size as usize,
+                    local_work_size as usize,
+                )?;
+
+                let res = if l.1 == 0 && Rc::strong_count(&l.0) == 1 {
+                    l.0.clone()
+                } else {
+                    Rc::new(allocator.pop_front().unwrap_or_else(|| unsafe {
+                        program.create_buffer::<F>(size as usize).unwrap()
+                    }))
+                };
+                kernel
+                    .arg(res.as_ref())
+                    .arg(l.0.as_ref())
+                    .arg(&l.1)
+                    .arg(&size)
+                    .arg(&c)
+                    .run()?;
+
+                if Rc::strong_count(&l.0) == 1 {
+                    allocator.push_back(Rc::try_unwrap(l.0).unwrap())
+                }
+
+                Ok((Some((res, 0)), None))
             }
         }
     }
@@ -1226,6 +1414,62 @@ pub(crate) fn do_extended_fft<F: FieldExt, C: CurveAffine<ScalarExt = F>>(
     //end_timer!(timerall);
     a
 }
+
+pub(crate) fn do_extended_fft_from_origin_values<F: FieldExt, C: CurveAffine<ScalarExt = F>>(
+    pk: &ProvingKey<C>,
+    program: &Program,
+    origin_values_buffer: &mut Buffer<F>,
+    allocator: &mut LinkedList<Buffer<F>>,
+    helper: &mut ExtendedFFTHelper<F>,
+) -> EcResult<Buffer<F>> {
+    let origin_size = 1u32 << pk.vk.domain.k();
+    let extended_size = 1u32 << pk.vk.domain.extended_k();
+    let local_work_size = 128;
+    let global_work_size = extended_size / local_work_size;
+
+    //let timerall = start_timer!(|| "gpu eval unit");
+    let values = allocator
+        .pop_front()
+        .unwrap_or_else(|| unsafe { program.create_buffer::<F>(extended_size as usize).unwrap() });
+
+    //let timer = start_timer!(|| "distribute powers zeta");
+    do_distribute_powers_zeta(
+        pk,
+        program,
+        origin_values_buffer,
+        &helper.coset_powers_buffer,
+    )?;
+    //end_timer!(timer);
+
+    //let timer = start_timer!(|| "eval fft prepare");
+    let kernel_name = format!("{}_eval_fft_prepare", "Bn256_Fr");
+    let kernel = program.create_kernel(
+        &kernel_name,
+        global_work_size as usize,
+        local_work_size as usize,
+    )?;
+    kernel
+        .arg(origin_values_buffer)
+        .arg(&values)
+        .arg(&origin_size)
+        .run()?;
+    //end_timer!(timer);
+
+    //let timer = start_timer!(|| "do fft pure");
+    let domain = &pk.vk.domain;
+    let a = do_fft_pure(
+        program,
+        values,
+        domain.extended_k(),
+        allocator,
+        &helper.pq_buffer,
+        &helper.omegas_buffer,
+    );
+    //end_timer!(timer);
+    //end_timer!(timerall);
+    a
+}
+
 
 #[cfg(feature = "cuda")]
 pub(crate) fn do_fft_pure<F: FieldExt>(
@@ -1531,6 +1775,33 @@ impl<F: FieldExt> ProveExpression<F> {
         }
     }
 
+    fn fit_flat_scale(
+        acc: &ProveExpression<F>,
+        x: &ProveExpression<F>,
+        n: usize,
+    ) -> bool {
+        let a = acc.flat_unit_scale(n);
+        let b = x.flat_unit_scale(n);
+        match (a, b) {
+            (Some((mut la, _)), Some((mut lb, _))) => {
+                la.append(&mut lb);
+                let mut s = HashSet::new();
+                for x in &la {
+                    s.insert(x.get_group());
+                }
+                if s.len() <= n {
+                    println!("set size {} {:?}", s.len(), la);
+                    true
+                } else {
+                    false
+                }
+            },
+            _ => false
+        }
+    }
+
+
+
 
     fn reconstruct_tree(
         mut tree: Vec<(BTreeMap<ProveExpressionUnit, u32>, BTreeMap<u32, F>)>,
@@ -1605,17 +1876,53 @@ impl<F: FieldExt> ProveExpression<F> {
             .map(|(k, ys)| Self::reconstruct_units_coeff(k, ys))
             .collect::<Vec<_>>();
 
-        let mut tree_merge_scale = vec![];
+        let mut merge_same = vec![];
         let last = c.iter().skip(1).fold(c[0].clone(), |acc, x| {
             if Self::is_scale_with_same_unit(&acc, x) {
                 Self::Op(Box::new(acc), Box::new(x.clone()), Bop::Sum)
             } else {
-                tree_merge_scale.push(acc);
+                merge_same.push(acc);
                 x.clone()
             }
         });
-        tree_merge_scale.push(last);
+        merge_same.push(last);
+        //let merge_same = c;
 
+        println!("start merge scale:");
+        let mut tree_merge_scale = vec![];
+
+        for i in 0..10 {
+            let mut cs = vec![];
+            for c in &merge_same {
+                if let Some(a) = c.get_scale_unit() {
+                    if a.get_rotation() == i {
+                        cs.push(c.clone())
+                    }
+                }
+            }
+
+            let len = cs.len();
+
+            let expr = cs
+                .into_iter()
+                .reduce(|acc, x| {
+                    Self::Op(Box::new(acc), Box::new(x), Bop::Sum)
+                });
+
+            if let Some(e) = expr {
+                tree_merge_scale.push(e)
+            } else {
+                assert!(len == 0)
+            }
+        }
+
+        for c in &merge_same {
+            if c.get_scale_unit() == None {
+                tree_merge_scale.push(c.clone())
+            }
+        }
+
+        //println!("tree merge scale {:?} {:?}", tree_merge_scale, merge_same);
         return tree_merge_scale
             .into_iter()
             //.map(|(k, ys)| Self::reconstruct_units_coeff(k, ys))
