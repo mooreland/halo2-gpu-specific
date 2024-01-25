@@ -452,6 +452,16 @@ impl<G: Group> EvaluationDomain<G> {
         self.extended_omega
     }
 
+    /// Get the coset for test
+    pub fn get_coset(&self) -> G::Scalar {
+        self.g_coset
+    }
+
+    /// Get the coset_inv for test
+    pub fn get_coset_inv(&self) -> G::Scalar {
+        self.g_coset_inv
+    }
+
     /// Multiplies a value by some power of $\omega$, essentially rotating over
     /// the domain.
     pub fn rotate_omega(&self, value: G::Scalar, rotation: Rotation) -> G::Scalar {
